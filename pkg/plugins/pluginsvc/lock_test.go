@@ -332,6 +332,7 @@ func TestUninstall_DoesNotTouchSkillsKey(t *testing.T) {
 type hookPluginStore struct {
 	storage.PluginStore
 	beforeDelete func() error
+	beforeUpdate func(plugins.InstalledPlugin) error
 }
 
 func (s *hookPluginStore) Delete(ctx context.Context, name string, scope plugins.Scope, projectRoot string) error {
@@ -341,6 +342,15 @@ func (s *hookPluginStore) Delete(ctx context.Context, name string, scope plugins
 		}
 	}
 	return s.PluginStore.Delete(ctx, name, scope, projectRoot)
+}
+
+func (s *hookPluginStore) Update(ctx context.Context, p plugins.InstalledPlugin) error {
+	if s.beforeUpdate != nil {
+		if err := s.beforeUpdate(p); err != nil {
+			return err
+		}
+	}
+	return s.PluginStore.Update(ctx, p)
 }
 
 type failingDematerializeAdapter struct {
