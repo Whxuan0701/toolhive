@@ -23,6 +23,8 @@ import (
 // holding the per-plugin lock. Mirror of skillsvc.installFromOCI, substituting
 // the plugin supply-chain check (config.Name == OCI repo last segment) and
 // hydrating Components/Dependencies from the plugin OCI config.
+//
+//nolint:gocyclo // pull, validate, hydrate, and locked install are one transactional path
 func (s *service) installFromOCI(
 	ctx context.Context,
 	opts plugins.InstallOptions,
