@@ -24,6 +24,17 @@ import (
 // name is resolved against the local OCI store, then the registry lookup.
 // Mirror of skillsvc.Install, substituting the plugin install backends.
 func (s *service) Install(ctx context.Context, opts plugins.InstallOptions) (*plugins.InstallResult, error) {
+	return s.install(ctx, opts, false)
+}
+
+// installAlreadyLocked is for sync/upgrade while the per-plugin lock is held.
+func (s *service) installAlreadyLocked(ctx context.Context, opts plugins.InstallOptions) (*plugins.InstallResult, error) {
+	return s.install(ctx, opts, true)
+}
+
+func (s *service) install(
+	ctx context.Context, opts plugins.InstallOptions, alreadyLocked bool,
+) (*plugins.InstallResult, error) {
 	scope, projectRoot, err := normalizeProjectRoot(opts.Scope, opts.ProjectRoot)
 	if err != nil {
 		return nil, err
@@ -36,9 +47,10 @@ func (s *service) Install(ctx context.Context, opts plugins.InstallOptions) (*pl
 
 	// Git references are dispatched first; the prefix is unambiguous and
 	// cannot collide with OCI references. installFromGit holds the per-plugin
-	// lock across extraction, DB, group, lock-file, and rollback.
+	// lock across extraction, DB, group, lock-file, and rollback unless the
+	// caller already holds it (alreadyLocked).
 	if gitresolver.IsGitReference(opts.Name) {
-		return s.installFromGit(ctx, opts, scope)
+		return s.installFromGit(ctx, opts, scope, alreadyLocked)
 	}
 
 	// Splice opts.Version as the tag for tag-less OCI-like references.
@@ -57,8 +69,8 @@ func (s *service) Install(ctx context.Context, opts plugins.InstallOptions) (*pl
 	}
 	if isOCI {
 		// installFromOCI holds the per-plugin lock across extraction, DB,
-		// group, lock-file, and rollback.
-		return s.installFromOCI(ctx, opts, scope, ref)
+		// group, lock-file, and rollback unless the caller already holds it.
+		return s.installFromOCI(ctx, opts, scope, ref, alreadyLocked)
 	}
 
 	// Plain plugin name.
@@ -66,7 +78,22 @@ func (s *service) Install(ctx context.Context, opts plugins.InstallOptions) (*pl
 		return nil, httperr.WithCode(err, http.StatusBadRequest)
 	}
 
-	return s.installByName(ctx, opts, scope)
+	return s.installByName(ctx, opts, scope, alreadyLocked)
+}
+
+// validateExpectedCanonicalName rejects an install whose resolved plugin name
+// differs from the lock entry identity Sync/Upgrade is repairing.
+func validateExpectedCanonicalName(opts plugins.InstallOptions) error {
+	if opts.ExpectedCanonicalName == "" || opts.Name == opts.ExpectedCanonicalName {
+		return nil
+	}
+	return httperr.WithCode(
+		fmt.Errorf(
+			"plugin name %q does not match lock entry name %q",
+			opts.Name, opts.ExpectedCanonicalName,
+		),
+		http.StatusUnprocessableEntity,
+	)
 }
 
 // installByName handles installation for a validated plain plugin name. It
@@ -76,9 +103,16 @@ func (s *service) installByName(
 	ctx context.Context,
 	opts plugins.InstallOptions,
 	scope plugins.Scope,
+	alreadyLocked bool,
 ) (*plugins.InstallResult, error) {
-	ctx, unlock := s.lockPlugin(ctx, opts.Name, scope, opts.ProjectRoot)
-	defer unlock()
+	if !alreadyLocked {
+		var unlock func()
+		ctx, unlock = s.lockPlugin(ctx, opts.Name, scope, opts.ProjectRoot)
+		defer unlock()
+	}
+	// Lock is held from here (by us or the caller). Nested OCI/registry
+	// backends must not re-acquire.
+	const lockHeld = true
 
 	if len(opts.LayerData) == 0 {
 		resolved := false
@@ -90,7 +124,7 @@ func (s *service) installByName(
 			}
 		}
 		if !resolved {
-			return s.installFromRegistryLookup(ctx, opts, scope)
+			return s.installFromRegistryLookup(ctx, opts, scope, lockHeld)
 		}
 	}
 
@@ -122,6 +156,7 @@ func (s *service) installFromRegistryLookup(
 	ctx context.Context,
 	opts plugins.InstallOptions,
 	scope plugins.Scope,
+	alreadyLocked bool,
 ) (*plugins.InstallResult, error) {
 	if s.pluginLookup != nil {
 		// Use the last path segment as the search query (matching
@@ -160,7 +195,7 @@ func (s *service) installFromRegistryLookup(
 		}
 
 		if len(matches) == 1 {
-			return s.installFromRegistryHit(ctx, opts, scope, matches[0])
+			return s.installFromRegistryHit(ctx, opts, scope, matches[0], alreadyLocked)
 		}
 
 		if len(matches) > 1 {
@@ -194,6 +229,7 @@ func (s *service) installFromRegistryHit(
 	opts plugins.InstallOptions,
 	scope plugins.Scope,
 	hit PluginSearchHit,
+	alreadyLocked bool,
 ) (*plugins.InstallResult, error) {
 	pkg, pkgErr := selectOCIPluginPackage(opts.Name, hit.Packages)
 	if pkgErr != nil {
@@ -214,7 +250,7 @@ func (s *service) installFromRegistryHit(
 			http.StatusUnprocessableEntity,
 		)
 	}
-	return s.installFromOCI(ctx, opts, scope, ref)
+	return s.installFromOCI(ctx, opts, scope, ref, alreadyLocked)
 }
 
 // selectOCIPluginPackage selects the first OCI package from a registry entry's
